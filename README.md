@@ -8,17 +8,25 @@ in the stack: guest kernel, hypervisor/KVM, or the RMM.
 
 Per iteration and thread:
 
-1. **Fill** — all Z registers are loaded with a per-register byte pattern
-   (Z_n = 0x40+n), all P registers with 0x80|n, FFR with all-ones
-   (`ptrue`/`wrffr`).
-2. **Preempt** — `sched_yield()`, short `nanosleep()`, `getpid()` or an
-   occasional 200 µs sleep, plus thread switching between 1–4 worker
-   threads, to force context switches and realm/world exits.
-3. **Read back** — all Z/P registers are stored out with `str` and FFR is
-   read with `rdffr`; results are compared against the patterns.
-4. **Functional compute** — an SVE intrinsic kernel (u8 add over 1 MB +
-   f32 FMA) is checked against a constant expected result.
-5. **VL check** — `rdvl` must not change behind the program's back.
+1. **Fill** — all Z registers (`Z0–Z31`), all P registers (`P0–P15`), and
+   `FFR` are loaded with deterministic non-zero patterns that vary across
+   register index, byte lane, thread ID, and iteration (so cross-thread
+   context swaps, stale restores, and intra-register lane permutations are
+   all detected).
+2. **Preempt & Migrate** — a pure integer busy-spin loop (no syscalls, no
+   FP/SIMD instructions) runs inside the same `asm volatile` block while an
+   asynchronous migrator thread calls `sched_setaffinity(worker_tid, ...)`
+   to force both same-vCPU timer-IRQ preemption and IPI-driven cross-vCPU
+   migrations while SVE state is live in EL0.
+3. **VL check & Read back** — inside the same `asm volatile` block, `rdvl`
+   verifies the effective vector length (`ZCR_EL1`) before storing all Z/P
+   registers (`str`) and `FFR` (`rdffr`); results are then compared against
+   the thread's expected patterns.
+4. **Functional compute** — SVE intrinsic kernels (predicated `u8` add +
+   store + reduction over 1 MB, and `f32` FMA reduction) are checked against
+   reference results and output buffers.
+5. **Post-compute VL check** — `rdvl` is checked again after the compute
+   kernels.
 
 Any mismatch is reported as
 `[FAIL] t<thread> iter <n>: <where>: <reg> corrupted (len <L>, first diff
@@ -59,29 +67,21 @@ exercised whenever the host preempts the vCPU or the host side uses SVE.
 
 ## Implementation notes
 
-* Fill/read-back use one `asm volatile` per register with an explicit
-  address operand (no `MUL VL` offset arithmetic) and live in `noinline`
-  helpers, so no compiler-generated SVE code can be scheduled between
-  filling and reading back the patterns.
-* The read-back buffers are **per-thread**; the comparison is done on
-  memory only, in a separate function: glibc's `memcmp`/`memcpy`/`printf`
-  use NEON registers, and NEON v0–v31 alias the low 128 bits of Z0–Z31 —
-  a `memcmp` between fill and read-back (or shared read-back buffers
-  raced between threads) would otherwise produce bogus corruption
-  reports whose expected/got dumps look identical.
-* FFR is written (`wrffr p0.b`) *before* the P-register patterns are
-  loaded, because P0 doubles as the all-true scratch predicate.
+* Fill, busy-spin, `rdvl` verification, and read-back execute inside a
+  **single `asm volatile` block** (`sve_fill_spin_readback`) with `z0–z31`,
+  `p0–p15`, and `ffr` declared in the clobber list. This prevents the
+  compiler from scheduling any FP/NEON/SVE code or register spills inside
+  the pattern window while properly informing the compiler that callee-saved
+  `d8–d15` (low 64 bits of `z8–z15`) are modified.
+* Expected pattern buffers, read-back buffers, and `u8` compute output
+  buffers are **per-thread**; comparisons are performed on memory only after
+  read-back completes, avoiding NEON `v0–v31` aliasing with `Z0–Z31`.
+* `FFR` is loaded with a canonical monotonic predicate bitmask (`wrffr p0.b`)
+  *before* `P0–P15` are loaded, using `P0` as scratch.
 
 ## Pre-validating under qemu-user (optional)
 
-    qemu-aarch64 ./sve-test 1000 2
-
-Known artifact: `qemu-aarch64` 8.2.x has a signal-frame SVE save/restore
-bug; with ≥4 threads you may see a handful of failures in the thread doing
-the long `nanosleep` (iter % 64 == 0), always Z0, with the "got" value
-being the timespec `{tv_sec=0, tv_nsec=200000}`. That is a qemu-user bug,
-not a real corruption — the authoritative result is the one from the real
-Realm VM, where any mismatch is a genuine save/restore bug.
+    qemu-aarch64 ./sve-test 100 4
 
 ## Why the preemption points avoid syscalls
 
@@ -94,11 +94,14 @@ bytes valid, rest zero). That is the documented SVE syscall ABI, not a
 save/restore bug, and it happens identically under any RMM (observed
 the same under both Islet RMM and TF-RMM).
 
-The test instead forces context switches through timer-IRQ-driven
-preemption (long busy-spins, no syscalls) and CPU migration
-(`sched_setaffinity` done *before* the pattern fill, taking effect on a
-later scheduler tick). Those paths exercise the full-width SVE
-save/restore (guest kernel `fpsimd_save()`/`task_fpsimd_load()` plus the
-RMM REC world switches), which is what this test validates. **Never add
-syscalls inside the fill → readback window.**
+Moreover, calling `sched_setaffinity(0, ...)` from a worker thread before
+filling patterns migrates the calling thread synchronously inside the
+syscall before returning to userspace, and pinning to a single CPU would
+prevent migration during the spin window. Instead, the test uses a pure
+integer busy-spin inside the pattern window while a separate migrator
+thread calls `sched_setaffinity(worker_tid, ...)` from the outside. That
+triggers kernel migration IPIs and timer-IRQ preemption via `el0_irq`,
+exercising full-width SVE save/restore (`fpsimd_save()`/`task_fpsimd_load()`
+and RMM REC world switches). **Never add syscalls inside the fill → readback
+window.**
 
